@@ -1,75 +1,61 @@
 from __future__ import annotations
-
 import json
+import os
+import re
+import warnings
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
+
+TRAINER_KEYS = frozenset(
+    {
+        "_comment",
+        "_model_file",
+        "_model_class",
+        "_cell_tokens",
+        "_grid",
+        "_grid_cell",
+        "n_sims",
+        "stage",
+        "code_hash",
+        "resume_from",
+        "_cell",
+        "seed",
+    }
+)
 
 
 @dataclass
 class TrainingConfig:
-    
-    # wiring
-    save_dir: str = "./runs/fsp"
-    _model_file: str = "/u/fsemenzato/negtrail/marks/mark.py"
-    _model_class: str = "MarkSH"
-    bootstrap_pretrain_from: str = "/u/fsemenzato/negtrail/marks/runs/precomp_d16/best_bootstrap.pt"
-
-    # mark architecture
-    sh_basis: str = "physical"            # physical | e3nn
-    radial: str = "gaussian"              # gaussian | fourier_mlp
-    taper: str = "cosine"                 # cosine | mas
-    mark_positivity: str = "free"         # free | softplus
-    l_max: int = 2
-    
-    dc_normalize: bool = True
-    l2_normalize_high_l: bool = False     # per-l L2-normalize W_l for l>=1
-    l2_normalize_l0: bool = False         # L2-normalize the l=0 channel
-    subtract_dc_high_l: bool = False      # fourier_mlp: DC-subtract l>=1 FALSE, no DC component
-    
-    gaussian_high_l_init: str = "match_l0"  # match_l0 | zero | noise (l>=1 seed)
-    n_radial_basis: int = 12              # gaussian radial
-    k0_frac: float = 0.2                  # gaussian radial
-    radial_hidden: int = 16               # fourier_mlp radial
-    radial_n_fourier: int = 8             # fourier_mlp radial
-    nyquist_taper_kpass: float = 0.85
-    nyquist_taper_floor: float = 0.0
-    mas_taper_power: float = 4.0          # mas taper exponent
-    input_transform: str = "log1p"
-    sh_convention: str = "physics"   
-    gam_hidden_dim: int = 16
-    cross_hidden_dim: int = 8
-    cross_inputs: tuple = ("E0", "E2", "I3_norm")
-    
-
-    # data
+    save_dir: str = "./runs/run"
+    _model_class: str = "HessianMark"
+    bootstrap_pretrain_from: str = ""
     mas_scheme: str = "PCS"
     box_size: float = 1000.0
     grid_dim: int = 128
-    data_root: str = "/path/to/BSQ_128"
+    data_root: str = "${DATA}/BSQ_128"
     param_file: str = "BSQ_params.txt"
     data_name: str = "dm_z0_PCS_128.npy"
     num_workers: int = 8
-
-    # optimization
     device: str = "cuda"
-    batch_size: int = 16
+    batch_size: int = 8
     num_epochs: int = 700
-    learning_rate: float = 5e-4
+    learning_rate: float = 0.0005
     marker_lr_multiplier: float = 2.0
     theta_projector_lr_multiplier: float = 0.25
     pdd_projector_lr_multiplier: float = 0.0
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0001
     grad_clip_norm: float = 10.0
     patience: int = 20
-    min_delta: float = 1e-5
+    min_delta: float = 1e-05
     use_lr_scheduler: bool = True
     lr_patience: int = 8
     lr_gamma: float = 0.5
-    lr_min: float = 1e-7
-
-    # loss
-    loss_function: str = "conditional_infonce_adaptive"
+    lr_min: float = 1e-07
+    seed: int = 42
+    split_seed: Optional[int] = None
+    loss_function: str = "conditional_infonce"
+    marked_features: str = "pmm"
     similarity_mode: str = "mahalanobis"
     ortho_mode: str = "embedding"
     embedding_dim: int = 16
@@ -79,58 +65,137 @@ class TrainingConfig:
     summary_projector_type: str = "mlp"
     temperature: float = 0.05
     k_min_idx: int = 0
-    k_max_idx: int = 47 # kmax=0.3 h/Mpc
-
-    # negative sampling
+    k_max_idx: int = 47
+    mahal_log_diag_clamp: Optional[float] = None
+    mahal_diagonal: bool = False
+    metric_trainable: bool = True
+    metric_lr_multiplier: float = 1.0
+    feature_standardize: bool = False
+    feature_stats_file: str = ""
+    load_bootstrap_metric: bool = False
+    mark_reg_weight: float = 0.0
+    legacy_clip_frozen_head: bool = False
+    head_hidden_dim: int = 128
+    head_depth: int = 2
+    head_dropout: float = 0.0
+    regression_features: str = "pmm"
+    keep_every_n_epochs: int = 0
     n_real: int = 128
     n_far: int = 384
     n_close: int = 32
     neighborhood_scale: float = 0.15
     min_distance_scale: float = 0.03
     negative_exclusion_scale: float = 0.03
-
-    # validation
-    val_negative_scheme: str = "train_like"       # global_fixed | train_like | val_local_global
+    local_all_anchor_exclusion_scale: float = 0.03
+    val_negative_scheme: str = "train_like"
     val_fraction: float = 0.15
-    val_every_n_epochs: int = 1
     n_val_synthetic: int = 512
-    save_every_n_epochs: int = 1
-
-    # bootstrap wiring
-    bootstrap_warmup_epochs: int = 20
-    bootstrap_freeze_pdd_projector: bool = True
-    reuse_pdd_feature_cache: bool = True
+    save_last_every_n_epochs: int = 5
+    auto_resume: bool = False
 
     def to_dict(self) -> dict:
         from dataclasses import asdict
-        return asdict(self)
+
+        d = asdict(self)
+        for k, v in vars(self).items():
+            if k not in d and (not k.startswith("__")):
+                if k == "_provided_keys":
+                    continue
+                d[k] = v
+        return d
 
 
-
-def _resolve_paths(cfg: "TrainingConfig", config_path: Optional[Path]) -> None:
-    base = config_path.parent if config_path else Path.cwd()
-    for attr in ("data_root", 
-                "save_dir", 
-                "bootstrap_pretrain_from",):
-        val = getattr(cfg, attr)
-        if val and not Path(val).is_absolute():
-            setattr(cfg, attr, str((base / val).resolve()))
+_ENV_RE = re.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]*)\\}")
 
 
-def load_config(config_path: str, n_sims: int = -1, stage: Optional[str] = None) -> "TrainingConfig":
-    path = Path(config_path).resolve()
+def expand_path(value: str, base: Path) -> str:
+    def _sub(m):
+        name = m.group(1)
+        if name not in os.environ:
+            raise KeyError(
+                f"config path uses ${{{name}}} but it is not set in the environment"
+            )
+        return os.environ[name]
+
+    v = _ENV_RE.sub(_sub, str(value))
+    p = Path(v)
+    return str(p if p.is_absolute() else (base / p).resolve())
+
+
+def read_config(path, seen=()):
+    path = Path(path).resolve()
+    if path in seen:
+        raise ValueError(f"Configuration inheritance cycle at {path}")
     data = json.loads(path.read_text())
+    parent = data.pop("extends", None)
+    base = read_config(path.parent / parent, (*seen, path)) if parent else {}
+    for key in (
+        "data_root",
+        "save_dir",
+        "bootstrap_pretrain_from",
+        "feature_stats_file",
+    ):
+        if data.get(key):
+            data[key] = expand_path(data[key], path.parent)
+    return {**base, **data}
+
+
+def load_config(
+    config_path: str,
+    n_sims: int = -1,
+    stage: Optional[str] = None,
+    warn_unknown: bool = True,
+) -> "TrainingConfig":
+    path = Path(config_path).resolve()
+    data = read_config(path)
     cfg = TrainingConfig()
-    
+    from marks import get_mark_class
+
+    mark_cls = get_mark_class(data.get("_model_class", cfg._model_class))
+    for key, value in getattr(mark_cls, "DEFAULTS", {}).items():
+        setattr(cfg, key, value)
     known = {f.name for f in fields(cfg)}
     for k, v in data.items():
-        if k in known:
-            setattr(cfg, k, v)
-
-    if n_sims is not None:
-        cfg.n_sims = n_sims
+        setattr(cfg, k, v)
+    cfg._provided_keys = set(data.keys())
+    cfg.n_sims = int(n_sims) if n_sims is not None else -1
     if stage is not None:
         cfg.stage = stage
-    cfg.sh_convention = "physics" if cfg.sh_basis == "physical" else "e3nn_component"
-    _resolve_paths(cfg, path)
+    for attr in (
+        "data_root",
+        "save_dir",
+        "bootstrap_pretrain_from",
+        "feature_stats_file",
+    ):
+        val = getattr(cfg, attr)
+        if val:
+            setattr(cfg, attr, expand_path(val, path.parent))
+    if cfg._model_class == "MarkSH":
+        cfg.sh_convention = (
+            "physics" if cfg.sh_basis == "physical" else "e3nn_component"
+        )
+    if warn_unknown:
+        from marks import get_mark_class
+
+        try:
+            mark_cls = get_mark_class(cfg._model_class)
+            mark_keys = set(getattr(mark_cls, "KNOWN_KEYS", ()))
+        except KeyError:
+            mark_keys = set()
+        unknown = sorted(
+            (
+                k
+                for k in data
+                if k not in known
+                and k not in mark_keys
+                and (k not in TRAINER_KEYS)
+                and (not k.startswith("_comment"))
+            )
+        )
+        if unknown:
+            warnings.warn(
+                f"{path.name}: {len(unknown)} config key(s) are read by neither the trainer nor {cfg._model_class}: {unknown}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     return cfg
